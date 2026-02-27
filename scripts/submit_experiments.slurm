@@ -9,7 +9,6 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:a100:1
 #SBATCH --time=12:00:00
-#SBATCH --account=your_allocation_name
 
 # -----------------------------------------------------------------------------
 # PRISM Stage 1-3 Experiment Runner for CURC Alpine resources.
