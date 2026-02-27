@@ -3,6 +3,7 @@
 #SBATCH --output=prism_%j.out
 #SBATCH --error=prism_%j.err
 #SBATCH --partition=aa100
+#SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
