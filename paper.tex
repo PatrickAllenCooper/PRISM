@@ -1,0 +1,610 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{natbib}
+\usepackage{xcolor}
+
+\newtheorem{claim}{Claim}
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\EFE}{\mathcal{G}}
+\newcommand{\VFE}{\mathcal{F}}
+\newcommand{\KL}[2]{D_{\mathrm{KL}}\!\left[#1 \,\|\, #2\right]}
+\newcommand{\E}[1]{\mathbb{E}\!\left[#1\right]}
+\newcommand{\Esub}[2]{\mathbb{E}_{#1}\!\left[#2\right]}
+
+\title{PRISM: Predictive Inference for Self-Directed Model Training via Active Free Energy Minimization}
+\author{Patrick Cooper}
+\date{Working Draft --- \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We develop a framework in which active inference governs the preference optimization training loop of a foundation language model exploring a partially observable space. The central observation is that an LLM is already a predictive coder: pre-training minimizes cross-entropy against a data distribution, and the resulting predictive distribution $p_\theta(o \mid a, x_t)$ constitutes the model's beliefs about what it would observe given an action and a history. We show that making this predictive process \emph{active}---allowing the model to select actions that maximally improve its own predictions---yields a natural formulation of the DPO objective as variational free energy (VFE) minimization and of the preference signal as expected free energy (EFE). The framework requires no commitment to a representation of hidden states: the belief state \emph{is} the predictive distribution, and belief updates \emph{are} changes in what the model predicts. The resulting meta-optimization loop naturally balances epistemic exploration and pragmatic task fulfillment, and admits tractable approximations grounded in the LLM's native computations.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{The Predictive Foundation}
+\label{sec:foundation}
+
+\subsection{The LLM as Predictive Coder}
+
+A pre-trained language model computes, for any context $x$ and candidate continuation $y$, a predictive distribution $p_\theta(y \mid x)$. Pre-training minimizes the cross-entropy against the data distribution:
+\begin{equation}
+\label{eq:pretraining}
+\mathcal{L}_{\mathrm{PT}} = -\Esub{p_{\mathrm{data}}(x,y)}{\ln p_\theta(y \mid x)}
+\end{equation}
+This cross-entropy \emph{is} a free energy. What it is not, currently, is \emph{active}: the model does not choose what to predict next based on what would be most informative. Making it active is the contribution of this paper.
+
+\subsection{The Exploration Setting}
+
+Consider a space $\mathcal{S}$ that generates observations through an unknown process. The LLM does not need to know what $\mathcal{S}$ is. It interacts with $\mathcal{S}$ by emitting an action $a_t$ (a query, a hypothesis, an intervention---any output directed at the space) and receiving an observation $o_t$ (the space's response). The exploration history accumulates as:
+\begin{equation}
+\label{eq:history}
+x_t = (a_1, o_1, \, a_2, o_2, \, \ldots, \, a_{t-1}, o_{t-1})
+\end{equation}
+
+The LLM's generative model is its own predictive distribution over what the space would return:
+\begin{equation}
+\label{eq:predictive}
+p_\theta(o \mid a, x_t)
+\end{equation}
+This is the model's prediction of what it would observe if it took action $a$ given everything it has seen so far. This quantity is what the LLM computes natively---it is next-token prediction, conditioned on the exploration history.
+
+\begin{remark}
+We make no commitment to a representation of the latent structure of $\mathcal{S}$. Whatever hidden states generate the observations are real, but the LLM need not represent them explicitly. The latent structure is whatever makes $o_t$ conditionally dependent on $o_{<t}$ given $a_{\leq t}$. The model's job is to predict observations well, and its beliefs about $\mathcal{S}$ are fully characterized by its predictive distribution.
+\end{remark}
+
+
+\subsection{Notation}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}cl@{}}
+\toprule
+\textbf{Symbol} & \textbf{Meaning} \\
+\midrule
+$\mathcal{S}$ & The space being explored (structure unknown to the model) \\
+$o \in \mathcal{O}$ & Observations (responses from the space) \\
+$a \in \mathcal{A}$ & Actions (LLM outputs: queries, hypotheses, interventions) \\
+$x_t$ & Exploration history $(a_1, o_1, \ldots, a_{t-1}, o_{t-1})$ \\
+$p_\theta(o \mid a, x_t)$ & The LLM's predictive distribution (beliefs about the space) \\
+$\pi_\theta(a \mid x_t)$ & The LLM's policy (action selection given history) \\
+$p_{\mathrm{ref}}(\cdot \mid x_t)$ & Reference distribution (pre-trained model or prior checkpoint) \\
+$p(o \mid C)$ & Preferred observations (task preferences) \\
+$b_t \equiv p_\theta(\cdot \mid \cdot, x_t)$ & Belief state: the predictive distribution at epoch $t$ \\
+\bottomrule
+\end{tabular}
+\caption{Notation summary. The belief state is the predictive distribution itself, not a separate posterior over hidden states.}
+\label{tab:notation}
+\end{table}
+
+
+%% ============================================================
+\section{Variational Free Energy as Prediction Error}
+\label{sec:vfe}
+
+At training epoch $t$, the model has taken action $a_t$ and received observation $o_t$. The variational free energy decomposes into two terms that are native to the LLM's computation:
+
+\begin{equation}
+\label{eq:vfe}
+\VFE_t = \underbrace{-\ln p_\theta(o_t \mid a_t, x_{<t})}_{\text{surprise (prediction error)}} + \underbrace{\KL{p_\theta(\cdot \mid x_t)}{p_{\mathrm{ref}}(\cdot \mid x_t)}}_{\text{complexity (cost of belief revision)}}
+\end{equation}
+
+The first term is the prediction error---how surprised was the model by what the space actually returned? This is the cross-entropy loss that LLMs are pre-trained on, except now computed against observations from the space rather than against a static corpus. The second term is the KL divergence from the reference distribution, penalizing beliefs that deviate too far from the model's starting point.
+
+\subsection{DPO as VFE Minimization}
+
+This correspondence is not analogical. The standard DPO loss:
+\begin{equation}
+\label{eq:dpo}
+\mathcal{L}_{\mathrm{DPO}}(\theta) = -\mathbb{E}_{(x, y_w, y_l) \sim \mathcal{D}} \left[ \log \sigma \left( \beta \left( \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\mathrm{ref}}(y_w \mid x)} - \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\mathrm{ref}}(y_l \mid x)} \right) \right) \right]
+\end{equation}
+encodes exactly this structure. The log-ratio $\log \pi_\theta / \pi_{\mathrm{ref}}$ is the implicit reward:
+\begin{equation}
+\label{eq:implicit-reward}
+r^*(x, y) = \beta \log \frac{\pi_\theta(y \mid x)}{\pi_{\mathrm{ref}}(y \mid x)} + \beta \log Z(x)
+\end{equation}
+which measures how much the model's predictions have shifted from the reference in a direction that explains the preference data. The preference data $\mathcal{D}$ provides the accuracy signal (which predictions were confirmed or disconfirmed by the space), and the reference $\pi_{\mathrm{ref}}$ provides the complexity penalty.
+
+\begin{claim}
+\label{claim:dpo-vfe}
+The DPO update is VFE minimization where:
+\begin{align}
+p_\theta(\cdot \mid x_t) &\leftrightarrow \text{approximate posterior (current beliefs)} \\
+p_{\mathrm{ref}}(\cdot \mid x_t) &\leftrightarrow \text{prior (beliefs before this round of evidence)} \\
+\mathcal{D} &\leftrightarrow \text{likelihood (observations from the space, encoded as preferences)}
+\end{align}
+The belief update \emph{is} the change in predictive distribution induced by the DPO gradient step.
+\end{claim}
+
+
+\subsection{The Two-Level Structure}
+
+This VFE interpretation reveals a two-level architecture:
+
+\begin{description}
+    \item[Level 1 (VFE --- parameter update):] Given a preference dataset, the DPO step minimizes VFE by adjusting the predictive distribution to account for new observations. This is the \emph{perception} step in active inference: updating beliefs in light of evidence.
+    \item[Level 2 (EFE --- data construction):] Before each DPO step, an \emph{action selection} step constructs the preference dataset by evaluating which candidate explorations would be most valuable. This is the \emph{action} step in active inference: selecting queries that reduce uncertainty or advance the task.
+\end{description}
+
+Standard DPO performs Level~1 only, with a fixed preference dataset. The contribution of this framework is Level~2: using expected free energy to construct the preference signal adaptively.
+
+
+%% ============================================================
+\section{Expected Free Energy as the Preference Signal}
+\label{sec:efe}
+
+\subsection{Pure Epistemic Foraging}
+
+For the case of pure epistemic exploration---no task objective, just mapping the space---the expected free energy of an action reduces to the negative expected information gain:
+
+\begin{equation}
+\label{eq:efe-epistemic}
+\EFE_{\mathrm{epistemic}}(a, b_t) = -\mathcal{I}(a, b_t)
+\end{equation}
+
+where the information gain $\mathcal{I}$ is defined entirely through the predictive distribution:
+
+\begin{equation}
+\label{eq:info-gain}
+\mathcal{I}(a, b_t) = \Esub{p_\theta(o \mid a, x_t)}{\KL{p_\theta(\cdot \mid x_t, a, o)}{p_\theta(\cdot \mid x_t)}}
+\end{equation}
+
+This has a direct reading: the epistemic value of an action is the expected magnitude of the belief update it would cause. An action is informative if, after observing the space's response, the model's predictions about what \emph{future} actions would yield change significantly. An action is uninformative if the response was already predictable---it confirms what the model already believes.
+
+\begin{remark}
+\label{rem:model-relative}
+The information gain is computed with respect to the LLM's \emph{current} predictive model, making it model-relative rather than objective. An action that is highly informative to a poorly calibrated model might be uninformative to a well-calibrated one. This is a feature: the exploration strategy is automatically adaptive to the model's current state of knowledge. However, it also means the quality of exploration depends on the quality of the base model. If the LLM has a badly miscalibrated predictive distribution, it may systematically underestimate the information gain of actions in regions of the space it does not know it does not understand.
+\end{remark}
+
+
+\subsection{The Full EFE with Pragmatic Value}
+
+When a task objective $p(o \mid C)$ is present, the full expected free energy reintroduces the pragmatic term:
+
+\begin{equation}
+\label{eq:efe-full}
+\EFE(a, b_t) = \underbrace{-\mathcal{I}(a, b_t)}_{\text{epistemic value}} + \underbrace{\KL{p_\theta(o \mid a, x_t)}{p(o \mid C)}}_{\text{pragmatic value}}
+\end{equation}
+
+The epistemic term rewards actions that change the model's mind. The pragmatic term penalizes predicted observations that diverge from task preferences. Both terms are measured in nats, making them commensurable without a tuning coefficient.
+
+\begin{remark}
+\label{rem:pragmatic-separation}
+The pragmatic term is what forces the conceptual separation between ``what I expect to see'' and ``what I want to see.'' In the pure epistemic case, this distinction does not arise: to believe something about the space just \emph{is} to predict certain observations from it, and the predictive distribution and the belief state are the same object. The pragmatic term introduces a second distribution---the preference prior $p(o \mid C)$---that the predictive distribution is compared against but need not match.
+\end{remark}
+
+
+\subsection{EFE-Derived Preference Pairs}
+\label{sec:efe-pairs}
+
+Given exploration history $x_t$, the preference dataset at epoch $t$ is constructed as follows:
+
+\begin{enumerate}
+    \item \textbf{Generate} $K$ candidate actions $\{a_1, \ldots, a_K\} \sim \pi_\theta(\cdot \mid x_t)$.
+    \item \textbf{Simulate} the predictive consequences: for each $a_k$, compute $p_\theta(o \mid a_k, x_t)$.
+    \item \textbf{Evaluate} expected free energy $\EFE(a_k, b_t)$ for each candidate.
+    \item \textbf{Rank} candidates by $\EFE$ (ascending, since agents minimize $\EFE$).
+    \item \textbf{Select} preference pairs:
+    \begin{equation}
+    \label{eq:pair-selection}
+    y_w = \arg\min_k \EFE(a_k, b_t), \quad y_l \sim \text{sample from high-}\EFE \text{ candidates}
+    \end{equation}
+\end{enumerate}
+
+The preference ordering is:
+\begin{equation}
+\label{eq:pref-ordering}
+a_i \succ a_j \iff \EFE(a_i, b_t) < \EFE(a_j, b_t)
+\end{equation}
+
+For pure epistemic foraging, this simplifies: prefer the action whose expected observation would cause a larger update to the predictive distribution:
+\begin{equation}
+\label{eq:epistemic-ordering}
+a_i \succ a_j \iff \Esub{p_\theta(o \mid a_i, x_t)}{\KL{p_\theta(\cdot \mid x_t, a_i, o)}{p_\theta(\cdot \mid x_t)}} > \Esub{p_\theta(o \mid a_j, x_t)}{\KL{p_\theta(\cdot \mid x_t, a_j, o)}{p_\theta(\cdot \mid x_t)}}
+\end{equation}
+
+The winner in each preference pair is the action that teaches the model more.
+
+This yields the EFE-derived preference dataset at epoch $t$:
+\begin{equation}
+\label{eq:efe-dataset}
+\mathcal{D}_{\mathrm{EFE}}^{(t)} = \big\{(x_t, y_w, y_l) : \EFE(y_w, b_t) < \EFE(y_l, b_t)\big\}
+\end{equation}
+
+
+\subsection{The Adaptive DPO Loss}
+
+Substituting $\mathcal{D}_{\mathrm{EFE}}^{(t)}$ into the DPO objective:
+
+\begin{equation}
+\label{eq:aif-dpo}
+\mathcal{L}_{\mathrm{AIF\text{-}DPO}}^{(t)}(\theta) = -\mathbb{E}_{(x, y_w, y_l) \sim \mathcal{D}_{\mathrm{EFE}}^{(t)}} \left[ \log \sigma \left( \beta \left( \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\mathrm{ref}}(y_w \mid x)} - \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\mathrm{ref}}(y_l \mid x)} \right) \right) \right]
+\end{equation}
+
+The preference dataset $\mathcal{D}_{\mathrm{EFE}}^{(t)}$ is non-stationary: it is reconstructed at each epoch because the belief state $b_t$ changes as the model learns.
+
+\begin{claim}
+\label{claim:implicit-reward}
+The implicit reward learned by AIF-DPO converges to the negative expected free energy:
+\begin{equation}
+\label{eq:implicit-efe}
+r^*(x, y) \to -\EFE(y, b_t) = \mathcal{I}(y, b_t) - \KL{p_\theta(o \mid y, b_t)}{p(o \mid C)}
+\end{equation}
+The trained policy therefore favors actions that are jointly informative (high information gain) and task-aligned (close to preferred observations). In the pure epistemic case, $r^*(x,y) \to \mathcal{I}(y, b_t)$: the reward \emph{is} the information gain.
+\end{claim}
+
+
+%% ============================================================
+\section{The Meta-Optimization Loop}
+\label{sec:algorithm}
+
+Combining the two levels, the full training procedure is:
+
+\begin{algorithm}[H]
+\caption{AIF-DPO Meta-Optimization}
+\label{alg:aif-dpo}
+\begin{algorithmic}[1]
+\REQUIRE Foundation model $\pi_{\theta_0}$, space $\mathcal{S}$, (optional) task preferences $p(o \mid C)$, candidates $K$
+\STATE Initialize $\pi_{\mathrm{ref}} \leftarrow \pi_{\theta_0}$, \; $x_0 \leftarrow \varnothing$
+\FOR{$t = 0, 1, 2, \ldots$}
+    \STATE \textbf{Generate:} Sample $K$ candidate actions $\{a_1, \ldots, a_K\} \sim \pi_{\theta_t}(\cdot \mid x_t)$
+    \FOR{each candidate $a_k$}
+        \STATE Compute predictive distribution $p_{\theta_t}(o \mid a_k, x_t)$
+        \STATE Execute $a_k$ in $\mathcal{S}$ $\rightarrow$ receive observation $o_k$
+        \STATE Compute post-observation predictive shift: $\KL{p_{\theta_t}(\cdot \mid x_t, a_k, o_k)}{p_{\theta_t}(\cdot \mid x_t)}$
+        \STATE Estimate information gain: $\hat{\mathcal{I}}(a_k) \leftarrow$ predictive shift (or expectation over predicted $o$)
+        \STATE \textbf{If task:} Compute pragmatic value $\KL{p_{\theta_t}(o \mid a_k, x_t)}{p(o \mid C)}$
+        \STATE $\EFE(a_k, b_t) \leftarrow -\hat{\mathcal{I}}(a_k) + \KL{p_{\theta_t}(o \mid a_k, x_t)}{p(o \mid C)}$
+    \ENDFOR
+    \STATE \textbf{Construct:} $\mathcal{D}_{\mathrm{EFE}}^{(t)} \leftarrow$ preference pairs ranked by $\EFE$
+    \STATE \textbf{Update (VFE minimization):} $\theta_{t+1} \leftarrow \theta_t - \eta \nabla_\theta \mathcal{L}_{\mathrm{AIF\text{-}DPO}}^{(t)}(\theta)$
+    \STATE \textbf{Extend history:} $x_{t+1} \leftarrow x_t \cup \{(a_k^*, o_k^*)\}$ for selected action(s)
+    \STATE \textbf{(Optional)} Refresh reference: $\pi_{\mathrm{ref}} \leftarrow \pi_{\theta_t}$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Roles of VFE and EFE in the loop.}
+Steps~4--11 are governed by \textbf{EFE}: deciding \emph{what} the model should learn from (which explorations are most valuable given its current predictive uncertainty). Step~13 is governed by \textbf{VFE}: updating \emph{how} the model predicts (adjusting the predictive distribution to account for what was observed). Step~14 closes the perception--action loop: new observations change the predictive distribution, which changes the EFE landscape, which changes the preference signal, which changes the next update.
+
+\paragraph{The perception--action cycle.}
+The DPO gradient step is perception: the model revises its beliefs in light of preference evidence. The EFE-based preference construction is action: the model selects which region of the space to probe next. This cycle is the defining structure of active inference, here instantiated at the level of the training loop rather than at the level of token generation.
+
+
+%% ============================================================
+\section{Exploration--Exploitation Dynamics}
+\label{sec:explore-exploit}
+
+The EFE decomposition (\cref{eq:efe-full}) provides a natural curriculum without hand-tuned schedules.
+
+\paragraph{Early exploration (high predictive uncertainty).}
+When the model's predictions about the space are poor---many actions yield high-entropy predictive distributions $p_\theta(o \mid a, x_t)$---the epistemic term dominates:
+\begin{equation}
+\EFE(a, b_t) \approx -\mathcal{I}(a, b_t)
+\end{equation}
+The model prefers actions that maximally reduce predictive uncertainty. Preference pairs are constructed to favor \emph{informative} explorations over \emph{redundant} ones, even if the informative ones are not directly task-relevant.
+
+\paragraph{Late exploration (low predictive uncertainty).}
+When the model's predictive distribution is well-calibrated---it accurately predicts what most actions would yield---the information gain $\mathcal{I}$ approaches zero for all candidates. The pragmatic term dominates:
+\begin{equation}
+\EFE(a, b_t) \approx \KL{p_\theta(o \mid a, b_t)}{p(o \mid C)}
+\end{equation}
+The model prefers actions that directly satisfy the task objective. Preference pairs now favor \emph{task-optimal} outputs over merely informative ones.
+
+\paragraph{The transition is automatic.}
+Unlike epsilon-greedy schedules or hand-tuned exploration bonuses, the transition from exploration to exploitation emerges from the belief dynamics. As the model learns more about the space (making better predictions), the information gain available from any action decreases, and the pragmatic term naturally takes over. No annealing schedule is required because the two terms are commensurable: both are measured in nats, and their relative magnitude is determined by the model's actual predictive uncertainty, not by a hyperparameter.
+
+
+%% ============================================================
+\section{Tractability}
+\label{sec:tractability}
+
+Computing EFE exactly over an LLM's full output distribution is intractable. However, the predictive-distribution framing admits approximations that are native to LLM inference.
+
+\subsection{Sampling-Based EFE Estimation}
+
+Generate $K$ candidates and evaluate each by:
+\begin{enumerate}
+    \item \textbf{Pre-observation prediction:} Compute $p_{\theta}(\cdot \mid x_t)$, the current predictive distribution.
+    \item \textbf{Execute} $a_k$ in the space $\rightarrow$ receive $o_k$.
+    \item \textbf{Post-observation prediction:} Compute $p_\theta(\cdot \mid x_t, a_k, o_k)$ by conditioning on the new observation.
+    \item \textbf{Estimate information gain} as the predictive shift:
+    \begin{equation}
+    \label{eq:info-gain-approx}
+    \hat{\mathcal{I}}(a_k, b_t) = \KL{p_\theta(\cdot \mid x_t, a_k, o_k)}{p_\theta(\cdot \mid x_t)}
+    \end{equation}
+    \item \textbf{Estimate pragmatic value} via the predictive--preference divergence:
+    \begin{equation}
+    \hat{\EFE}_{\mathrm{prag}}(a_k) = \KL{p_\theta(o \mid a_k, x_t)}{p(o \mid C)}
+    \end{equation}
+\end{enumerate}
+
+The information gain estimate in \cref{eq:info-gain-approx} uses the \emph{actual} observation $o_k$ rather than the expectation over predicted observations. This is a single-sample Monte Carlo estimate of $\mathcal{I}$, which is unbiased. The KL divergence between predictive distributions can be estimated via sampling or, for token-level distributions, computed exactly.
+
+\subsection{Amortized EFE via a Critic}
+
+Train a separate network $\EFE_\phi(a, x_t)$ to predict the EFE of candidate actions. The critic is trained on $(a, \EFE(a, b_t))$ pairs from the sampling-based estimator, amortizing the computation into a single forward pass.
+
+\begin{remark}
+The EFE critic plays the same architectural role as the reward model in standard RLHF, but its training signal comes from free energy rather than human preferences. In the pure epistemic case, the critic predicts information gain---it learns to recognize which queries would be surprising.
+\end{remark}
+
+\subsection{Latent Space EFE}
+
+For high-dimensional action spaces, operate in a learned latent representation:
+\begin{enumerate}
+    \item Encode candidate outputs into latent representations $z_k = f_\psi(a_k)$.
+    \item Compute EFE in latent space using a learned dynamics model.
+    \item Use the latent EFE for preference ranking.
+\end{enumerate}
+This reduces the dimensionality of the EFE computation while preserving the information-theoretic structure.
+
+\subsection{Predictive Entropy as a Proxy}
+
+In the pure epistemic setting, a further simplification is available. Rather than computing the full expected KL shift, one can use the entropy of the predictive distribution as a proxy:
+\begin{equation}
+\label{eq:entropy-proxy}
+\hat{\mathcal{I}}(a, b_t) \approx H\!\left[p_\theta(o \mid a, x_t)\right]
+\end{equation}
+Actions about which the model is maximally uncertain (high predictive entropy) are, under mild assumptions, the ones most likely to produce surprising observations and therefore the largest belief updates. This is a weaker signal than the full information gain but is computable from a single forward pass.
+
+
+%% ============================================================
+\section{Instantiation Spaces}
+\label{sec:instantiation}
+
+The framework is deliberately general---it says nothing about what the space $\mathcal{S}$ is. Different instantiations inherit the full formalism while differing in the structure of actions, observations, and the tractability of information gain computation.
+
+\paragraph{Causal structure spaces.}
+Hidden structure: a directed (possibly cyclic) graph over variables. Actions: interventional queries. Observations: resulting distributions. The predictive distribution $p_\theta(o \mid a, x_t)$ predicts the outcome of intervening on variable $X_i$ given the intervention history. Information gain is well-defined via Bayesian structure learning, and ground truth is available for evaluation. This is the most tractable instantiation and the natural starting point for empirical investigation.
+
+\paragraph{Program synthesis spaces.}
+Hidden structure: a full specification (I/O behaviors, edge cases, invariants). Actions: candidate programs. Observations: execution results. The epistemic term rewards diagnostic failures that reveal specification ambiguities; the pragmatic term rewards passing tests. Early informative failures transition to later comprehensive satisfaction.
+
+\paragraph{Scientific hypothesis spaces.}
+Hidden structure: a theory or model class (structure-activity relationships, phase diagrams). Actions: experimental proposals. Observations: assay or measurement results. The predictive distribution predicts experimental outcomes given the hypothesis space and experimental history.
+
+\paragraph{Information-theoretic spaces (knowledge retrieval).}
+Hidden structure: an entity-relation graph. Actions: search queries. Observations: returned documents. The framework provides a principled mechanism for multi-step query selection that current RAG pipelines lack.
+
+\paragraph{Strategic spaces.}
+Hidden structure: an opponent's strategy or utility function. Actions: moves or bids. Observations: opponent responses. A natural domain for belief-dependent exploration, though opponent adaptivity introduces non-stationarity beyond the current formalism.
+
+
+%% ============================================================
+\section{Open Formalisms}
+\label{sec:open}
+
+\subsection{The Pragmatic Term: Specifying $p(o \mid C)$}
+
+The task-preference prior admits several specification modes:
+
+\begin{description}
+    \item[Explicit specification.] For structured tasks, $C$ is defined directly (e.g., in causal discovery, high probability on observations consistent with the true graph).
+    \item[Learned from examples.] A few demonstrations of successful task completion define the preferred observation distribution.
+    \item[Human-in-the-loop.] The pragmatic term comes from sparse human feedback, while the epistemic term is computed automatically.
+    \item[Absent.] For pure epistemic foraging, $p(o \mid C)$ is undefined and the EFE reduces to negative information gain. No pragmatic specification is needed.
+\end{description}
+
+\subsection{Reference Distribution Refresh Schedule}
+
+In standard DPO, $\pi_{\mathrm{ref}}$ is fixed. With non-stationary preferences, periodically updating $\pi_{\mathrm{ref}} \leftarrow \pi_{\theta_t}$ may be necessary to prevent the KL constraint from becoming too loose or too tight. The refresh schedule interacts with the VFE complexity term: too-frequent refreshes lose the regularization benefit; too-infrequent refreshes create a stale prior that penalizes informative belief updates.
+
+\subsection{Quality of the Base Model}
+
+The information gain is computed with respect to the model's current predictive distribution. A base model whose predictive uncertainty is \emph{meaningful}---well-calibrated enough that high entropy genuinely indicates ignorance rather than noise---is a prerequisite for effective epistemic foraging. This suggests that model calibration, often treated as an afterthought in LLM evaluation, is load-bearing for the active inference framework.
+
+\subsection{Convergence Criteria}
+
+When should the meta-optimization loop terminate? Candidates:
+
+\begin{description}
+    \item[EFE plateau.] When $\min_k \EFE(a_k, b_t)$ stops decreasing, the model has exhausted both informative and task-relevant explorations.
+    \item[Predictive convergence.] When the predictive distribution is stable---new observations do not significantly change $p_\theta(\cdot \mid x_t)$---the model believes it has mapped the space. Formally: $\mathcal{I}(a, b_t) \approx 0$ for all candidate actions.
+    \item[Per-region convergence.] Stop exploring regions of the space where information gain has dropped below a threshold, allowing locally converged regions to be exploited while globally uncertain regions continue to receive exploratory budget.
+\end{description}
+
+
+
+%% ============================================================
+\section{Proposed Experiments}
+\label{sec:experiments}
+
+The framework's claims are empirically testable: EFE-based scoring should identify more informative actions than baselines, the full meta-optimization loop should converge faster than static preference training, and the exploration--exploitation transition should emerge without scheduling. We propose a staged experimental design that validates each claim in turn, progressing from cheap diagnostic experiments to the full training loop on realistic tasks.
+
+
+\subsection{Stage 1: Validating the Preference Signal}
+\label{sec:exp-stage1}
+
+The most fundamental claim is that EFE-based ranking of candidate actions identifies more informative ones than baselines. This can be tested without any DPO training---purely by scoring candidate queries and measuring exploration quality.
+
+\paragraph{Task: multi-hop question answering.}
+Multi-hop QA benchmarks (HotpotQA, MuSiQue, Bamboogle) require synthesizing evidence from multiple retrieval steps and have known ground-truth answers. The LLM receives a question $q$, maintains an evidence buffer $x_t$ of search results gathered so far, and must select the next search query from $K$ candidates generated by the model. No training loop is involved; the model's parameters are frozen throughout.
+
+\paragraph{Protocol.}
+At each step $t$:
+\begin{enumerate}
+    \item The model generates $K$ candidate search queries $\{a_1, \ldots, a_K\} \sim \pi_\theta(\cdot \mid q, x_t)$.
+    \item Each query is executed against a retrieval corpus, returning result $o_k$.
+    \item For each candidate, compute the estimated information gain:
+    \begin{equation}
+    \label{eq:exp-ig}
+    \hat{\mathcal{I}}(a_k) = \KL{p_\theta(\text{answer} \mid q, x_t, a_k, o_k)}{p_\theta(\text{answer} \mid q, x_t)}
+    \end{equation}
+    measuring how much the model's answer distribution shifts after incorporating the search result.
+    \item Select the query with highest $\hat{\mathcal{I}}$ (for pure epistemic) or lowest $\EFE$ (when including pragmatic scoring against a reference answer distribution).
+\end{enumerate}
+
+\paragraph{Baselines.}
+\begin{description}
+    \item[Relevance-ranked.] Select the query whose result has highest semantic similarity to the question (standard RAG retrieval).
+    \item[Diversity-ranked.] Select the query most dissimilar to previous queries (heuristic exploration).
+    \item[Random.] Uniform selection among candidates.
+    \item[ReAct / chain-of-thought.] Standard prompted multi-step reasoning with no explicit information-gain scoring.
+\end{description}
+
+\paragraph{Metrics.}
+\begin{description}
+    \item[Queries-to-correct-answer.] The primary metric: how many retrieval steps are needed to reach the correct answer? Lower is better. This directly tests whether EFE scoring identifies more informative queries.
+    \item[Information gained per query.] The average $\hat{\mathcal{I}}$ per step, measuring exploration efficiency in bits per action.
+    \item[Answer accuracy at fixed budget.] Given a fixed number of allowed queries (e.g., 3, 5, 10), what fraction of questions are answered correctly?
+\end{description}
+
+\paragraph{What this tests.}
+If EFE-ranked queries do not reach correct answers faster than relevance-ranked queries, the core preference signal is not useful and subsequent stages are unlikely to succeed. This is the cheapest possible falsification test for the framework.
+
+
+\subsection{Stage 2: Controlled Synthetic Environments}
+\label{sec:exp-stage2}
+
+Stage~2 tests the full AIF-DPO meta-optimization loop in environments where ground truth is known and information gain can be computed exactly or with high precision.
+
+
+\subsubsection{Experiment 2a: Database Exploration}
+\label{sec:exp-db}
+
+\paragraph{Setup.}
+Construct a relational database with known structure: tables for customers, orders, products, and pricing, governed by a hidden business rule (e.g., ``orders above \$500 from customers in tier A receive a 15\% discount if placed before Q4''). The rule is a deterministic function of several variables, unknown to the model.
+
+\paragraph{Interaction protocol.}
+The LLM issues SQL queries (actions) against the database and receives result sets (observations). The exploration history $x_t$ is the sequence of query--result pairs. The hidden structure $\mathcal{S}$ is the business rule. The task (pragmatic term) is to correctly state the rule.
+
+\paragraph{Why this environment.}
+The action space (SQL queries) is structured enough that candidate generation is natural. The observation space (result sets) is unambiguous---no noise, no ambiguity in what was returned. The hidden structure is finite and enumerable: given enough well-chosen queries, the rule can be identified with certainty. Information gain is well-defined: each result set eliminates candidate rules from the hypothesis space.
+
+\paragraph{Full AIF-DPO loop.}
+\begin{enumerate}
+    \item \textbf{Generate} $K$ candidate SQL queries from the current policy $\pi_{\theta_t}(\cdot \mid x_t)$.
+    \item \textbf{Execute} each query, receive result sets.
+    \item \textbf{Score} by EFE: the epistemic term measures how many candidate rules are eliminated; the pragmatic term scores proximity to a correct rule statement.
+    \item \textbf{Construct} preference pairs from the EFE ranking.
+    \item \textbf{DPO update} on the preference pairs.
+    \item \textbf{Repeat} with updated belief state.
+\end{enumerate}
+
+\paragraph{Controlled variations.}
+\begin{description}
+    \item[Rule complexity.] Vary the number of variables and conditions in the hidden rule, from simple (one variable, one threshold) to complex (four variables, interaction terms).
+    \item[Database size.] Vary the number of rows, controlling how informative a single query can be.
+    \item[Noise.] Introduce stochastic exceptions to the rule (e.g., 5\% of rows violate it), testing robustness of information gain estimation under observation noise.
+\end{description}
+
+
+\subsubsection{Experiment 2b: API Exploration}
+\label{sec:exp-api}
+
+\paragraph{Setup.}
+Construct a mock REST API with documented endpoints but hidden business logic. The API might expose endpoints for user management, order processing, and inventory, but the actual validation rules, rate limits, authentication flows, and state machine transitions are undocumented. The model must discover these by probing.
+
+\paragraph{Interaction protocol.}
+The LLM generates API calls (actions) with varying parameters and observes the responses (status codes, response bodies, error messages). The hidden structure is the set of undocumented behaviors. The task is to produce a complete specification of the API's actual behavior, including edge cases.
+
+\paragraph{Why this environment.}
+This is closer to real-world tool use than database exploration: the observation space is richer (structured JSON responses, error messages with varying informativeness), the state space includes session-dependent behavior (authentication tokens, rate limit counters), and the action space is less constrained (the model must choose endpoints, HTTP methods, headers, and payloads). It exercises the framework's ability to handle partially observable state that reveals itself through probing.
+
+\paragraph{Grading.}
+The ground truth is the full API specification. Evaluation scores the model's generated specification against this ground truth on coverage (what fraction of behaviors were discovered), accuracy (what fraction of stated behaviors are correct), and efficiency (how many API calls were required).
+
+
+\subsection{Stage 3: Multi-Step Web Search}
+\label{sec:exp-stage3}
+
+Stage~3 applies the framework to a realistic task with approximate information gain computation, testing whether the method is robust to noisy EFE estimates.
+
+\paragraph{Task: complex research questions.}
+Construct a benchmark of research questions that require multi-step web search to answer, where no single search result suffices and the model must decide what to search for next based on what it has already found. Questions should span factual synthesis (``What were the key factors in X, and how did Y respond?''), comparative analysis (``How do the approaches of A and B differ on issue C?''), and temporal reasoning (``How has policy X evolved since its introduction?'').
+
+\paragraph{Protocol.}
+The model receives a question and iteratively: generates candidate search queries, executes them, observes the results, and updates its evidence buffer. At each step, EFE scoring determines which query to issue next. After a fixed budget of queries (or upon convergence), the model produces a final answer.
+
+\paragraph{Information gain estimation.}
+The predictive distribution is the model's distribution over possible answers given the evidence collected so far: $p_\theta(\text{answer} \mid q, x_t)$. After each search result, this distribution shifts. The information gain is estimated as the KL divergence between the pre- and post-observation answer distributions, computed via sampling. This is a noisier estimate than in Stages~1--2, testing the framework's robustness to approximate EFE computation.
+
+\paragraph{Pragmatic term.}
+The task-preference prior $p(o \mid C)$ scores whether the current evidence is sufficient to answer the question well. For factual questions, this can be graded against known ground truth. For synthesis questions, evaluation uses a reference answer produced by an expert or a more capable model, scored on factual coverage, accuracy, and coherence.
+
+\paragraph{Baselines.}
+In addition to the Stage~1 baselines (relevance-ranked, diversity-ranked, random, ReAct), Stage~3 adds:
+\begin{description}
+    \item[Static DPO.] Train on a fixed preference dataset of search query pairs, then deploy without further adaptation. This tests whether non-stationary preferences improve over static ones.
+    \item[Curiosity bonus (CD-RLHF).] Add a novelty bonus $r_{\mathrm{intrinsic}}$ to a relevance-based reward, with the bonus weight tuned by grid search. This tests whether the automatic exploration--exploitation transition outperforms a tuned bonus schedule.
+\end{description}
+
+\paragraph{Metrics.}
+\begin{description}
+    \item[Answer quality at fixed budget.] F1 or ROUGE against reference answers, given 3, 5, and 10 allowed queries. The primary metric for practical value.
+    \item[Queries to confidence threshold.] The number of queries before the model's answer distribution concentrates (entropy drops below a threshold). Tests convergence speed.
+    \item[Budget robustness.] Plot answer quality as a function of query budget. EFE-guided exploration should degrade more gracefully than baselines under tight budgets, because it prioritizes the most informative queries first.
+\end{description}
+
+
+\subsection{Cross-Stage Analysis}
+\label{sec:exp-analysis}
+
+Across all three stages, we propose the following analyses to test the framework's structural predictions:
+
+\paragraph{Exploration--exploitation transition.}
+For Stages~2 and 3, plot the epistemic and pragmatic components of EFE over the course of exploration. The framework predicts that the epistemic term dominates early (the model issues broad, information-seeking queries) and the pragmatic term dominates late (the model issues focused, task-relevant queries). This transition should emerge from the belief dynamics without any scheduling. The key diagnostic is whether the crossover point correlates with the model having acquired sufficient evidence to answer correctly.
+
+\paragraph{Information gain trajectory.}
+Plot cumulative information gain (total KL shift in the predictive distribution) over queries. EFE-guided exploration should front-load information gain---acquiring the most informative observations first---producing a concave trajectory. Baselines should show a more linear or even convex trajectory, wasting early queries on redundant or uninformative observations.
+
+\paragraph{Preference signal quality.}
+In Stages~2 and 3, compare the EFE-derived preference pairs against oracle preference pairs (constructed using ground-truth information gain with access to the hidden structure). Measure agreement rate: how often does the EFE ranking match the oracle ranking? This quantifies the quality of the approximate EFE computation and identifies failure modes.
+
+\paragraph{Ablation: epistemic term only vs.\ full EFE.}
+Run the pure epistemic variant ($\EFE = -\mathcal{I}$ only, no pragmatic term) alongside the full EFE. The pure epistemic variant should explore more broadly but may fail to converge on task-relevant answers, especially under tight query budgets. The full EFE should balance exploration and task-directed search. The comparison isolates the contribution of each term.
+
+
+%% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+The present framework sits at the intersection of several active research areas. We organize the discussion around four threads: the free energy principle and active inference, control as probabilistic inference, preference optimization for LLMs, and intrinsic motivation in language model training.
+
+\subsection{The Free Energy Principle and Active Inference}
+
+The free energy principle \citep{friston2006free,friston2010free} posits that biological agents minimize variational free energy as a unified account of perception, learning, and action. Active inference \citep{friston2015active,parr2022active} extends this to sequential decision-making by introducing expected free energy (EFE) as the quantity that governs policy selection, naturally decomposing into epistemic (information-seeking) and pragmatic (goal-fulfilling) components. Our framework inherits this decomposition but relocates it: rather than governing real-time action selection by an embodied agent, EFE governs the construction of the training signal for a foundation model's preference optimization loop.
+
+Recent work has begun connecting active inference to LLM-adjacent settings. \citet{tschantz2020reinforcement} demonstrated that active inference can scale to continuous control tasks when implemented with deep ensembles and amortized inference, establishing that free-energy-based objectives are compatible with modern deep learning infrastructure. \citet{waters2025active} applied active inference as an actor--critic prompting protocol for medical LLMs. \citet{donnarumma2024integrating} combined LLM predictions with active inference for eye-movement simulation, using the LLM as a generative model within a hierarchical active inference loop. These works use active inference \emph{around} or \emph{alongside} LLMs; we propose using it \emph{over} the LLM's own training process, treating the DPO update itself as a free-energy-minimizing belief update.
+
+\subsection{Control as Probabilistic Inference}
+
+\citet{levine2018reinforcement} established a comprehensive framework showing that maximum entropy reinforcement learning is equivalent to exact probabilistic inference under deterministic dynamics and variational inference under stochastic dynamics. This ``control as inference'' perspective, developed independently under various names including KL-divergence control \citep{kappen2012optimal}, the Kalman duality \citep{todorov2008general}, and stochastic optimal control \citep{toussaint2009robot}, reveals that policy optimization is fundamentally a divergence-minimization problem.
+
+Our work extends this line of reasoning to the meta-level. Where \citet{levine2018reinforcement} shows that a single RL update can be viewed as inference, we show that the entire iterative DPO training loop---including the construction of the preference signal itself---can be cast as a hierarchical inference process. The VFE--EFE decomposition in active inference provides a principled two-level structure that the generic control-as-inference framework does not: VFE governs parameter updates (perception), while EFE governs data construction (action selection over the training curriculum).
+
+The connection between KL-regularized policy optimization and free energy has also been noted in the language model fine-tuning literature. \citet{korbak2022rl} observed that KL-penalized reward maximization in RLHF can be reframed as distribution matching, with the KL penalty against a reference policy playing the role of a complexity cost. Our contribution makes this implicit connection explicit and actionable by identifying the DPO loss as a VFE functional and replacing the static reward signal with an EFE-derived adaptive preference.
+
+\subsection{Direct Preference Optimization and Variational Extensions}
+
+Direct Preference Optimization \citep{rafailov2023direct} eliminated the need for explicit reward modeling in RLHF by showing that the constrained reward maximization problem admits a closed-form solution expressible as a classification loss over preference pairs. The resulting algorithm is stable and lightweight, but it inherits a fundamental limitation: the preference dataset $\mathcal{D}$ is fixed at training time. Subsequent work has addressed this through online and iterative variants. Online DPO \citep{xiong2023iterative,dong2024rlhf} generates new preference pairs from the current policy at each iteration, and self-play methods \citep{swamy2024minimax} model preference alignment as a game. These approaches make the preference signal adaptive but rely on external reward models or human annotators to score new candidates.
+
+Several works have explored variational perspectives on DPO. \citet{bohne2025mix} proposed Mix- and MoE-DPO, extending DPO with mixture-of-experts architectures using a stochastic variational EM algorithm that optimizes an ELBO over latent expert assignments. \citet{yu2024ava} developed Approximated Variational Alignment (AVA), grounding LLM alignment in Bayesian inverse reinforcement learning. These works enrich the DPO objective with latent structure but do not address the question of \emph{where the preference signal comes from}. Our framework complements these variational extensions by providing a principled, information-theoretic mechanism for constructing the preference data itself.
+
+\subsection{Intrinsic Motivation and Curiosity-Driven Exploration in LLMs}
+
+A growing body of work addresses the exploration problem in LLM training through intrinsic motivation. \citet{gao2025imagine} proposed IMAGINE, augmenting RL-based LLM reasoning with trajectory-aware intrinsic rewards. \citet{chen2025curiosity} introduced curiosity-driven RLHF (CD-RLHF), using token-level novelty bonuses to encourage diverse output generation. \citet{zheng2025calm} applied curiosity-driven exploration to LLM auditing for red-teaming.
+
+These approaches share our motivation---standard preference optimization underexplores the output space---but differ in mechanism. Intrinsic motivation methods typically add a bonus term $r_{\mathrm{intrinsic}}$ to an existing extrinsic reward, requiring careful tuning of the combination weight and lacking a principled account of when exploration should yield to exploitation. The active inference framework provides both: the EFE is a single objective whose epistemic and pragmatic components are commensurable (both measured in nats), and the transition from exploration to exploitation emerges from the belief dynamics rather than from a schedule. Furthermore, intrinsic motivation methods operate at the token or trajectory level within a single training step, while our framework operates at the meta-level, reconstructing the entire preference dataset at each epoch based on the current predictive uncertainty.
+
+
+%% ============================================================
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
