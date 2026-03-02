@@ -20,8 +20,8 @@ module purge
 module load anaconda
 module load cuda/12.1
 
-# Activate the conda environment (assuming one is already created)
-# conda activate prism_env
+# Activate the project conda environment
+conda activate prism_env
 
 # Echo system info
 echo "Running on host: $(hostname)"
