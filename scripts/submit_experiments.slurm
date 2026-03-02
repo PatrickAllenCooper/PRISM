@@ -17,7 +17,7 @@
 
 # Purge existing modules and load required compiler/MPI/CUDA environments
 module purge
-module load anaconda
+module load miniconda
 module load cuda/12.1
 
 # Activate the project conda environment
