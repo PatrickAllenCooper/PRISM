@@ -6,7 +6,7 @@ def compute_information_gain(
     prior_logits: torch.Tensor,
     posterior_logits: torch.Tensor,
 ) -> torch.Tensor:
-    """
+    r"""
     Computes Information Gain $\mathcal{I}$ as the KL divergence between 
     the post-observation predictive distribution and the pre-observation predictive distribution.
     
@@ -63,7 +63,7 @@ def compute_efe(
     information_gain: torch.Tensor,
     pragmatic_value: torch.Tensor = None
 ) -> torch.Tensor:
-    """
+    r"""
     Computes Expected Free Energy (EFE).
     
     Eq (8): EFE(a, b_t) = -\mathcal{I}(a, b_t) + D_{KL}[ p_\theta(o | a, x_t) || p(o | C) ]
